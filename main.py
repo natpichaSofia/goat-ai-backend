@@ -42,22 +42,35 @@ def get_box_metrics(box_a, box_b):
     ax1, ay1, ax2, ay2 = box_a
     bx1, by1, bx2, by2 = box_b
 
+    area_a = max(float((ax2 - ax1) * (ay2 - ay1)), 1.0)
+    area_b = max(float((bx2 - bx1) * (by2 - by1)), 1.0)
+
+    # ตรวจสอบว่าจุดกึ่งกลางของกรอบเล็กอยู่ภายในกรอบใหญ่หรือไม่
+    if area_a <= area_b:
+        sx1, sy1, sx2, sy2 = box_a
+        lx1, ly1, lx2, ly2 = box_b
+    else:
+        sx1, sy1, sx2, sy2 = box_b
+        lx1, ly1, lx2, ly2 = box_a
+
+    scx = (sx1 + sx2) / 2.0
+    scy = (sy1 + sy2) / 2.0
+    center_inside = (lx1 <= scx <= lx2) and (ly1 <= scy <= ly2)
+
     inter_x1 = max(ax1, bx1)
     inter_y1 = max(ay1, by1)
     inter_x2 = min(ax2, bx2)
     inter_y2 = min(ay2, by2)
 
     if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, area_a / area_b, False
 
     inter_area = float((inter_x2 - inter_x1) * (inter_y2 - inter_y1))
-    area_a = max(float((ax2 - ax1) * (ay2 - ay1)), 1.0)
-    area_b = max(float((bx2 - bx1) * (by2 - by1)), 1.0)
     union_area = area_a + area_b - inter_area
 
     iou = inter_area / max(union_area, 1.0)
     containment = inter_area / min(area_a, area_b)
-    return iou, containment, area_a / area_b
+    return iou, containment, area_a / area_b, center_inside
 
 
 def detect_valid_goats(image: Image.Image):
@@ -110,16 +123,17 @@ def detect_valid_goats(image: Image.Image):
                 "class_name": "goat"
             })
 
-    # ยุบกรอบซ้อนและกรอบชิ้นส่วนย่อยให้เหลือ 1 กรอบเต็มตัวต่อแพะ 1 ตัว
+    # จัดลำดับโดยให้น้ำหนักทั้งความมั่นใจและขนาดกรอบเต็มตัว
     raw_goats.sort(key=lambda item: item["raw_conf"] * (item["area"] ** 0.35), reverse=True)
     deduped_goats = []
 
     for candidate in raw_goats:
         is_duplicate = False
         for idx, kept in enumerate(deduped_goats):
-            iou, containment, area_ratio = get_box_metrics(candidate["box"], kept["box"])
-            if iou > 0.35 or containment > 0.55:
-                if area_ratio > 1.35 and candidate["raw_conf"] >= (kept["raw_conf"] * 0.65):
+            iou, containment, area_ratio, center_inside = get_box_metrics(candidate["box"], kept["box"])
+            # ตัดกรอบซ้อน กรอบครึ่งตัว หรือกรอบที่จุดกึ่งกลางซ้อนอยู่ในตัวเดียวกันทิ้ง
+            if iou > 0.25 or containment > 0.45 or (center_inside and iou > 0.15):
+                if area_ratio > 1.25 and candidate["raw_conf"] >= (kept["raw_conf"] * 0.60):
                     deduped_goats[idx] = candidate
                 is_duplicate = True
                 break
@@ -314,22 +328,17 @@ async def identify_goat(
 
         db_goats = json.loads(registered_goats)
         valid_goats = detect_valid_goats(image)
-        detections = []
+        raw_detections = []
 
         for g in valid_goats:
             x1, y1, x2, y2 = g["box"]
             crop_img = image.crop((max(0, x1), max(0, y1), min(w, x2), min(h, y2)))
-            cw, ch = crop_img.size
 
-            # คำนวณ deep_vec เพียง 1 ครั้งต่อตัว แล้วแชร์ให้มุมกลับด้านและมุมตัดชิด
             deep_vec = compute_deep_feature(crop_img)
             query_vecs = [
                 extract_goat_vector(crop_img, deep_vec),
                 extract_goat_vector(ImageOps.mirror(crop_img), deep_vec),
             ]
-            if cw > 40 and ch > 40:
-                tight_crop = crop_img.crop((int(cw * 0.05), int(ch * 0.05), int(cw * 0.95), int(ch * 0.95)))
-                query_vecs.append(extract_goat_vector(tight_crop, deep_vec))
 
             best_match = None
             best_score = -1.0
@@ -343,7 +352,7 @@ async def identify_goat(
                             best_score = score
                             best_match = reg
 
-            if best_match and best_score >= 0.78:
+            if best_match and best_score >= 0.80:
                 identity_info = {
                     "is_registered": True,
                     "goat_id": best_match.get("id", ""),
@@ -358,7 +367,7 @@ async def identify_goat(
                     "similarity": round(max(best_score, 0.0) * 100, 1)
                 }
 
-            detections.append({
+            raw_detections.append({
                 "box": g["box"],
                 "confidence": g["confidence"],
                 "class_id": g["class_id"],
@@ -368,13 +377,42 @@ async def identify_goat(
 
             del crop_img
 
+        # ชั้นป้องกันที่ 2: ไม่ให้มีแพะชื่อเดียวกันซ้ำในภาพเดียว
+        raw_detections.sort(
+            key=lambda d: d["identity"]["similarity"] if d["identity"]["is_registered"] else d["confidence"],
+            reverse=True
+        )
+        final_detections = []
+        claimed_goat_ids = {}
+
+        for det in raw_detections:
+            ident = det["identity"]
+            if ident["is_registered"] and ident.get("goat_id"):
+                gid = ident["goat_id"]
+                if gid in claimed_goat_ids:
+                    primary_box = claimed_goat_ids[gid]
+                    iou, containment, _, center_inside = get_box_metrics(det["box"], primary_box)
+                    # ถ้าเป็นกรอบซ้อนบนแพะตัวเดียวกัน ให้ตัดกรอบเกินทิ้ง
+                    if iou > 0.08 or containment > 0.15 or center_inside:
+                        continue
+                    # ถ้าเป็นแพะคนละตัวที่อยู่แยกกันชัดเจน ให้เปลี่ยนป้ายเป็นยังไม่ลงทะเบียน
+                    det["identity"] = {
+                        "is_registered": False,
+                        "name": "แพะ (ยังไม่ลงทะเบียน)",
+                        "similarity": ident["similarity"]
+                    }
+                else:
+                    claimed_goat_ids[gid] = det["box"]
+
+            final_detections.append(det)
+
         del image, contents
         gc.collect()
 
         return {
             "success": True,
-            "count": len(detections),
-            "detections": detections
+            "count": len(final_detections),
+            "detections": final_detections
         }
     except Exception as e:
         gc.collect()
