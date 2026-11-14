@@ -40,7 +40,7 @@ async def count_goat(file: UploadFile = File(...)):
         image = Image.open(io.BytesIO(contents)).convert("RGB")
         
         # 2. ให้ AI ทำนาย (ปรับ conf ลดลงเหลือ 0.35 เพื่อให้จับภาพแพะบนหน้าจอได้ง่ายขึ้น)
-        results = model(image, conf=0.35, iou=0.45)
+      results = model.predict(image, conf=0.15, iou=0.45, imgsz=320)
         
         detections = []
         result = results[0]
