@@ -20,9 +20,9 @@ app.add_middleware(
 
 try:
     model = YOLO("best.pt")
-    dummy_img = Image.new("RGB", (320, 320))
+    dummy_img = Image.new("RGB", (416, 416))
     with torch.no_grad():
-        model.predict(dummy_img, imgsz=320, verbose=False)
+        model.predict(dummy_img, imgsz=416, verbose=False)
     del dummy_img
     gc.collect()
     print("✅ โหลดและวอร์มโมเดลแพะ (best.pt) พร้อมใช้งาน!")
@@ -40,8 +40,16 @@ async def count_goat(file: UploadFile = File(...)):
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
 
+        # เพิ่ม agnostic_nms=True เพื่อให้คลาส Human ลบกรอบ Goat ที่ซ้อนทับบนตัวคนออก
         with torch.no_grad():
-            results = model.predict(image, conf=0.15, iou=0.45, imgsz=320, verbose=False)
+            results = model.predict(
+                image,
+                conf=0.20,
+                iou=0.45,
+                imgsz=416,
+                agnostic_nms=True,
+                verbose=False
+            )
 
         detections = []
         result = results[0]
