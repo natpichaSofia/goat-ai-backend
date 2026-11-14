@@ -56,9 +56,8 @@ def get_box_metrics(box_a, box_b):
     union_area = area_a + area_b - inter_area
 
     iou = inter_area / max(union_area, 1.0)
-    overlap_on_a = inter_area / area_a
     containment = inter_area / min(area_a, area_b)
-    return iou, overlap_on_a, containment
+    return iou, containment, area_a / area_b
 
 
 def detect_valid_goats(image: Image.Image):
@@ -68,16 +67,15 @@ def detect_valid_goats(image: Image.Image):
     with torch.no_grad():
         results = model.predict(
             image,
-            conf=0.25,
+            conf=0.10,
             iou=0.45,
             imgsz=480,
-            agnostic_nms=True,
+            agnostic_nms=False,
             verbose=False
         )
 
     result = results[0]
     raw_goats = []
-    human_boxes = []
 
     for box in result.boxes:
         class_id = int(box.cls.item())
@@ -87,11 +85,10 @@ def detect_valid_goats(image: Image.Image):
 
         box_w = max(coords[2] - coords[0], 0)
         box_h = max(coords[3] - coords[1], 0)
-        if (box_w * box_h) / img_area < 0.015:
-            continue
+        box_area = float(box_w * box_h)
 
-        if class_name in ["human", "person"] and confidence >= 0.35:
-            human_boxes.append((coords, confidence))
+        # กรองจุดรบกวนขนาดเล็กจิ๋วออก
+        if (box_area / img_area) < 0.018:
             continue
 
         is_goat_class = False
@@ -109,51 +106,34 @@ def detect_valid_goats(image: Image.Image):
                 "box": coords,
                 "confidence": round(confidence, 2),
                 "raw_conf": confidence,
+                "area": box_area,
                 "class_id": 0,
                 "class_name": "goat"
             })
 
-    # เรียงลำดับตามความมั่นใจจากมากไปน้อย แล้วตัดกรอบซ้อน / กรอบชิ้นส่วนย่อยทิ้ง
-    raw_goats.sort(key=lambda item: item["raw_conf"], reverse=True)
+    # จัดลำดับโดยให้น้ำหนักทั้งความมั่นใจและขนาดกรอบเต็มตัว เพื่อไม่ให้กรอบครึ่งตัวมาทับกรอบเต็มตัว
+    raw_goats.sort(key=lambda item: item["raw_conf"] * (item["area"] ** 0.35), reverse=True)
     deduped_goats = []
 
     for candidate in raw_goats:
         is_duplicate = False
-        for kept in deduped_goats:
-            iou, _, containment = get_box_metrics(candidate["box"], kept["box"])
-            if iou > 0.40 or containment > 0.58:
+        for idx, kept in enumerate(deduped_goats):
+            iou, containment, area_ratio = get_box_metrics(candidate["box"], kept["box"])
+            # หากกรอบซ้อนกัน หรือเป็นชิ้นส่วนย่อย (หัว/ขา/ครึ่งตัว) ที่ซ้อนอยู่ในตัวเดียวกัน ให้ยุบรวมเป็น 1 ตัว
+            if iou > 0.35 or containment > 0.55:
+                # ถ้ากรอบใหม่ครอบคลุมเต็มตัวมากกว่าและมั่นใจใกล้เคียงกัน ให้ใช้กรอบเต็มตัวแทน
+                if area_ratio > 1.35 and candidate["raw_conf"] >= (kept["raw_conf"] * 0.65):
+                    deduped_goats[idx] = candidate
                 is_duplicate = True
                 break
         if not is_duplicate:
             deduped_goats.append(candidate)
 
-    valid_goats = []
-    for g in deduped_goats:
-        is_false_on_human = False
-        for h_box, h_conf in human_boxes:
-            _, overlap_on_goat, _ = get_box_metrics(g["box"], h_box)
-            if overlap_on_goat > 0.80 and h_conf > (g["raw_conf"] + 0.25):
-                is_false_on_human = True
-                break
-        if not is_false_on_human:
-            valid_goats.append(g)
-
     del results
-    return valid_goats
+    return deduped_goats
 
 
-def build_foreground_mask(size=128):
-    y, x = np.ogrid[:size, :size]
-    center = size / 2.0
-    radius = size * 0.42
-    dist_sq = ((x - center) / radius) ** 2 + ((y - center) / radius) ** 2
-    return np.where(dist_sq <= 1.0, 1.0, 0.08).astype(np.float32)
-
-
-FG_MASK = build_foreground_mask(128)
-
-
-def normalize_centered(vec: np.ndarray) -> np.ndarray:
+def normalize_vec(vec: np.ndarray) -> np.ndarray:
     vec = vec.astype(np.float32)
     vec = vec - np.mean(vec)
     norm = np.linalg.norm(vec)
@@ -166,80 +146,77 @@ def extract_goat_vector(crop_img: Image.Image) -> list:
     resized_rgb = crop_img.resize((128, 128))
     hsv_arr = np.array(resized_rgb.convert("HSV"), dtype=np.float32)
     lab_arr = np.array(resized_rgb.convert("LAB"), dtype=np.float32)
-    gray_arr = np.array(resized_rgb.convert("L"), dtype=np.float32) * FG_MASK
+    gray_arr = np.array(resized_rgb.convert("L"), dtype=np.float32)
 
-    # 1. ลักษณะสีและจุดเด่นตามตำแหน่ง (เน้นส่วนหัว/ลำคอ และตัดอคติสีขาวพื้นหลัง)
-    weighted_slices = [
-        (slice(0, 56), slice(24, 104), 1.6),    # ส่วนหัว ใบหน้า เขา และลำคอ (ปลอกคอ/เครา)
-        (slice(0, 64), slice(0, 64), 1.0),      # ช่วงบนซ้าย
-        (slice(0, 64), slice(64, 128), 1.0),    # ช่วงบนขวา
-        (slice(64, 128), slice(0, 64), 1.0),    # ช่วงล่างซ้าย
-        (slice(64, 128), slice(64, 128), 1.0),  # ช่วงล่างขวา
-        (slice(28, 100), slice(28, 100), 1.2),  # ลำตัวแกนกลาง
+    # แบ่งโซนตามกายวิภาคของแพะ (ตัดพื้นหญ้า/ดินด้านล่างสุด 78%..100% ออก)
+    anatomical_zones = [
+        (slice(0, 56), slice(16, 112), 1.8),    # 1. ส่วนหัว ใบหน้า เขา หู (น้ำหนักสูงสุด)
+        (slice(24, 72), slice(20, 108), 1.6),   # 2. ลำคอ และหน้าอก (จับปลอกคอ เครา สีอก)
+        (slice(20, 62), slice(18, 110), 1.4),   # 3. แผ่นหลังและลำตัวช่วงบน (สีขนล้วน ไม่ติดพื้น)
+        (slice(36, 82), slice(14, 64), 1.0),    # 4. ลำตัวซีกซ้าย
+        (slice(36, 82), slice(64, 114), 1.0),   # 5. ลำตัวซีกขวา
     ]
 
     color_features = []
-    for sy, sx, zone_weight in weighted_slices:
-        w = FG_MASK[sy, sx].flatten()
+    for sy, sx, zone_weight in anatomical_zones:
         h_reg = hsv_arr[sy, sx]
         l_reg = lab_arr[sy, sx]
 
-        h_hist, _ = np.histogram(h_reg[:, :, 0].flatten(), bins=16, range=(0, 256), weights=w)
-        s_hist, _ = np.histogram(h_reg[:, :, 1].flatten(), bins=10, range=(0, 256), weights=w)
-        l_hist, _ = np.histogram(l_reg[:, :, 0].flatten(), bins=12, range=(0, 256), weights=w)
-        a_hist, _ = np.histogram(l_reg[:, :, 1].flatten(), bins=10, range=(0, 256), weights=w)
-        b_hist, _ = np.histogram(l_reg[:, :, 2].flatten(), bins=10, range=(0, 256), weights=w)
+        h_hist, _ = np.histogram(h_reg[:, :, 0].flatten(), bins=16, range=(0, 256))
+        s_hist, _ = np.histogram(h_reg[:, :, 1].flatten(), bins=12, range=(0, 256))
+        l_hist, _ = np.histogram(l_reg[:, :, 0].flatten(), bins=16, range=(0, 256))
+        a_hist, _ = np.histogram(l_reg[:, :, 1].flatten(), bins=12, range=(0, 256))
+        b_hist, _ = np.histogram(l_reg[:, :, 2].flatten(), bins=12, range=(0, 256))
 
         hist = np.concatenate([h_hist, s_hist, l_hist, a_hist, b_hist]).astype(np.float32)
         hist_sum = np.sum(hist)
         if hist_sum > 0:
             hist /= hist_sum
-        # Hellinger square-root + mean-centering ลดความเอนเอียงเวลาเจอแพะสีขาวเหมือนกัน
         hist = np.sqrt(np.maximum(hist, 0.0))
-        hist = normalize_centered(hist) * zone_weight
+        hist = normalize_vec(hist) * zone_weight
         color_features.append(hist)
 
-    appearance_vec = normalize_centered(np.concatenate(color_features))
+    appearance_vec = normalize_vec(np.concatenate(color_features))
 
-    # 2. โครงสร้างเส้นขอบและสัดส่วนท่าทาง (Spatial Edge Orientation)
-    gx = gray_arr[:, 1:] - gray_arr[:, :-1]
-    gy = gray_arr[1:, :] - gray_arr[:-1, :]
+    # โครงสร้างเส้นขอบเฉพาะช่วงตัวแพะ (ตัดพื้นหลังขอบนอกออก)
+    body_gray = gray_arr[8:104, 12:116]
+    gx = body_gray[:, 1:] - body_gray[:, :-1]
+    gy = body_gray[1:, :] - body_gray[:-1, :]
     gx = gx[:-1, :]
     gy = gy[:, :-1]
     mag = np.hypot(gx, gy)
     ang = (np.degrees(np.arctan2(gy, gx)) + 180.0) % 180.0
 
     edge_features = []
-    cell = 31
+    cell_h, cell_w = 23, 25
     for r in range(4):
         for c in range(4):
-            sub_mag = mag[r * cell:(r + 1) * cell, c * cell:(c + 1) * cell].flatten()
-            sub_ang = ang[r * cell:(r + 1) * cell, c * cell:(c + 1) * cell].flatten()
+            sub_mag = mag[r * cell_h:(r + 1) * cell_h, c * cell_w:(c + 1) * cell_w].flatten()
+            sub_ang = ang[r * cell_h:(r + 1) * cell_h, c * cell_w:(c + 1) * cell_w].flatten()
             e_hist, _ = np.histogram(sub_ang, bins=8, range=(0, 180), weights=sub_mag)
             e_sum = np.sum(e_hist)
             if e_sum > 0:
                 e_hist = e_hist / e_sum
-            e_hist = normalize_centered(np.sqrt(np.maximum(e_hist, 0.0)))
-            edge_features.append(e_hist)
+            edge_features.append(normalize_vec(np.sqrt(np.maximum(e_hist, 0.0))))
 
-    edge_vec = normalize_centered(np.concatenate(edge_features))
+    edge_vec = normalize_vec(np.concatenate(edge_features))
 
-    # 3. Deep Feature โครงสร้างใบหน้าและรูปร่างจาก YOLOv8
+    # โครงสร้างเชิงลึกจาก YOLOv8
     try:
         with torch.no_grad():
             embeds = model.embed(crop_img, imgsz=224, verbose=False)
         raw_deep = embeds[0].detach().cpu().numpy().flatten().astype(np.float32)
         signed_sqrt = np.sign(raw_deep) * np.sqrt(np.abs(raw_deep))
-        deep_vec = normalize_centered(signed_sqrt)
+        deep_vec = normalize_vec(signed_sqrt)
         combined = np.concatenate([
-            deep_vec * 0.45,
-            appearance_vec * 0.35,
-            edge_vec * 0.20
+            appearance_vec * 0.55,
+            deep_vec * 0.30,
+            edge_vec * 0.15
         ])
     except Exception:
-        combined = np.concatenate([appearance_vec * 0.65, edge_vec * 0.35])
+        combined = np.concatenate([appearance_vec * 0.75, edge_vec * 0.25])
 
-    combined = normalize_centered(combined)
+    combined = normalize_vec(combined)
     return [round(float(x), 5) for x in combined]
 
 
@@ -303,10 +280,7 @@ async def extract_goat_feature(file: UploadFile = File(...)):
         goat_detected = len(valid_goats) > 0
 
         if goat_detected:
-            best_goat = max(
-                valid_goats,
-                key=lambda g: (g["box"][2] - g["box"][0]) * (g["box"][3] - g["box"][1])
-            )
+            best_goat = max(valid_goats, key=lambda g: g["area"])
             x1, y1, x2, y2 = best_goat["box"]
             crop_img = image.crop((max(0, x1), max(0, y1), min(w, x2), min(h, y2)))
         else:
@@ -344,9 +318,16 @@ async def identify_goat(
         for g in valid_goats:
             x1, y1, x2, y2 = g["box"]
             crop_img = image.crop((max(0, x1), max(0, y1), min(w, x2), min(h, y2)))
+            cw, ch = crop_img.size
 
-            query_vec = extract_goat_vector(crop_img)
-            query_vec_flipped = extract_goat_vector(ImageOps.mirror(crop_img))
+            # เทียบทั้งภาพปกติ ภาพกลับด้าน และภาพตัดขอบแน่นขึ้นเล็กน้อย
+            query_vecs = [
+                extract_goat_vector(crop_img),
+                extract_goat_vector(ImageOps.mirror(crop_img)),
+            ]
+            if cw > 40 and ch > 40:
+                tight_crop = crop_img.crop((int(cw * 0.05), int(ch * 0.05), int(cw * 0.95), int(ch * 0.95)))
+                query_vecs.append(extract_goat_vector(tight_crop))
 
             best_match = None
             best_score = -1.0
@@ -354,15 +335,13 @@ async def identify_goat(
             for reg in db_goats:
                 for emb_obj in reg.get("embeddings", []):
                     ref_vec = emb_obj.get("vector", [])
-                    score_normal = cosine_similarity(query_vec, ref_vec)
-                    score_flip = cosine_similarity(query_vec_flipped, ref_vec)
-                    score = max(score_normal, score_flip)
-                    if score > best_score:
-                        best_score = score
-                        best_match = reg
+                    for q_vec in query_vecs:
+                        score = cosine_similarity(q_vec, ref_vec)
+                        if score > best_score:
+                            best_score = score
+                            best_match = reg
 
-            # เกณฑ์ 0.76 สำหรับรหัสอัตลักษณ์ที่หักค่าสีพื้นหลังแล้ว
-            if best_match and best_score >= 0.76:
+            if best_match and best_score >= 0.78:
                 identity_info = {
                     "is_registered": True,
                     "goat_id": best_match.get("id", ""),
