@@ -24,9 +24,9 @@ IS_CUSTOM_GOAT_MODEL = False
 
 try:
     model = YOLO("best.pt")
-    dummy_img = Image.new("RGB", (480, 480))
+    dummy_img = Image.new("RGB", (320, 320))
     with torch.no_grad():
-        model.predict(dummy_img, imgsz=480, verbose=False)
+        model.predict(dummy_img, imgsz=320, verbose=False)
     del dummy_img
     gc.collect()
     names_lower = [str(v).lower() for v in model.names.values()]
@@ -87,7 +87,6 @@ def detect_valid_goats(image: Image.Image):
         box_h = max(coords[3] - coords[1], 0)
         box_area = float(box_w * box_h)
 
-        # กรองจุดรบกวนขนาดเล็กจิ๋วออก
         if (box_area / img_area) < 0.018:
             continue
 
@@ -111,7 +110,7 @@ def detect_valid_goats(image: Image.Image):
                 "class_name": "goat"
             })
 
-    # จัดลำดับโดยให้น้ำหนักทั้งความมั่นใจและขนาดกรอบเต็มตัว เพื่อไม่ให้กรอบครึ่งตัวมาทับกรอบเต็มตัว
+    # ยุบกรอบซ้อนและกรอบชิ้นส่วนย่อยให้เหลือ 1 กรอบเต็มตัวต่อแพะ 1 ตัว
     raw_goats.sort(key=lambda item: item["raw_conf"] * (item["area"] ** 0.35), reverse=True)
     deduped_goats = []
 
@@ -119,9 +118,7 @@ def detect_valid_goats(image: Image.Image):
         is_duplicate = False
         for idx, kept in enumerate(deduped_goats):
             iou, containment, area_ratio = get_box_metrics(candidate["box"], kept["box"])
-            # หากกรอบซ้อนกัน หรือเป็นชิ้นส่วนย่อย (หัว/ขา/ครึ่งตัว) ที่ซ้อนอยู่ในตัวเดียวกัน ให้ยุบรวมเป็น 1 ตัว
             if iou > 0.35 or containment > 0.55:
-                # ถ้ากรอบใหม่ครอบคลุมเต็มตัวมากกว่าและมั่นใจใกล้เคียงกัน ให้ใช้กรอบเต็มตัวแทน
                 if area_ratio > 1.35 and candidate["raw_conf"] >= (kept["raw_conf"] * 0.65):
                     deduped_goats[idx] = candidate
                 is_duplicate = True
@@ -142,19 +139,29 @@ def normalize_vec(vec: np.ndarray) -> np.ndarray:
     return vec
 
 
-def extract_goat_vector(crop_img: Image.Image) -> list:
+def compute_deep_feature(crop_img: Image.Image):
+    try:
+        with torch.no_grad():
+            embeds = model.embed(crop_img, imgsz=160, verbose=False)
+        raw_deep = embeds[0].detach().cpu().numpy().flatten().astype(np.float32)
+        signed_sqrt = np.sign(raw_deep) * np.sqrt(np.abs(raw_deep))
+        return normalize_vec(signed_sqrt)
+    except Exception:
+        return None
+
+
+def extract_goat_vector(crop_img: Image.Image, deep_vec=None) -> list:
     resized_rgb = crop_img.resize((128, 128))
     hsv_arr = np.array(resized_rgb.convert("HSV"), dtype=np.float32)
     lab_arr = np.array(resized_rgb.convert("LAB"), dtype=np.float32)
     gray_arr = np.array(resized_rgb.convert("L"), dtype=np.float32)
 
-    # แบ่งโซนตามกายวิภาคของแพะ (ตัดพื้นหญ้า/ดินด้านล่างสุด 78%..100% ออก)
     anatomical_zones = [
-        (slice(0, 56), slice(16, 112), 1.8),    # 1. ส่วนหัว ใบหน้า เขา หู (น้ำหนักสูงสุด)
-        (slice(24, 72), slice(20, 108), 1.6),   # 2. ลำคอ และหน้าอก (จับปลอกคอ เครา สีอก)
-        (slice(20, 62), slice(18, 110), 1.4),   # 3. แผ่นหลังและลำตัวช่วงบน (สีขนล้วน ไม่ติดพื้น)
-        (slice(36, 82), slice(14, 64), 1.0),    # 4. ลำตัวซีกซ้าย
-        (slice(36, 82), slice(64, 114), 1.0),   # 5. ลำตัวซีกขวา
+        (slice(0, 56), slice(16, 112), 1.8),    # ส่วนหัว ใบหน้า เขา หู
+        (slice(24, 72), slice(20, 108), 1.6),   # ลำคอ และหน้าอก (ปลอกคอ/เครา)
+        (slice(20, 62), slice(18, 110), 1.4),   # แผ่นหลังและลำตัวช่วงบน
+        (slice(36, 82), slice(14, 64), 1.0),    # ลำตัวซีกซ้าย
+        (slice(36, 82), slice(64, 114), 1.0),   # ลำตัวซีกขวา
     ]
 
     color_features = []
@@ -178,7 +185,6 @@ def extract_goat_vector(crop_img: Image.Image) -> list:
 
     appearance_vec = normalize_vec(np.concatenate(color_features))
 
-    # โครงสร้างเส้นขอบเฉพาะช่วงตัวแพะ (ตัดพื้นหลังขอบนอกออก)
     body_gray = gray_arr[8:104, 12:116]
     gx = body_gray[:, 1:] - body_gray[:, :-1]
     gy = body_gray[1:, :] - body_gray[:-1, :]
@@ -201,19 +207,13 @@ def extract_goat_vector(crop_img: Image.Image) -> list:
 
     edge_vec = normalize_vec(np.concatenate(edge_features))
 
-    # โครงสร้างเชิงลึกจาก YOLOv8
-    try:
-        with torch.no_grad():
-            embeds = model.embed(crop_img, imgsz=224, verbose=False)
-        raw_deep = embeds[0].detach().cpu().numpy().flatten().astype(np.float32)
-        signed_sqrt = np.sign(raw_deep) * np.sqrt(np.abs(raw_deep))
-        deep_vec = normalize_vec(signed_sqrt)
+    if deep_vec is not None:
         combined = np.concatenate([
             appearance_vec * 0.55,
             deep_vec * 0.30,
             edge_vec * 0.15
         ])
-    except Exception:
+    else:
         combined = np.concatenate([appearance_vec * 0.75, edge_vec * 0.25])
 
     combined = normalize_vec(combined)
@@ -286,7 +286,8 @@ async def extract_goat_feature(file: UploadFile = File(...)):
         else:
             crop_img = image.crop((int(w * 0.1), int(h * 0.1), int(w * 0.9), int(h * 0.9)))
 
-        embedding = extract_goat_vector(crop_img)
+        deep_vec = compute_deep_feature(crop_img)
+        embedding = extract_goat_vector(crop_img, deep_vec)
 
         del image, crop_img, contents
         gc.collect()
@@ -320,14 +321,15 @@ async def identify_goat(
             crop_img = image.crop((max(0, x1), max(0, y1), min(w, x2), min(h, y2)))
             cw, ch = crop_img.size
 
-            # เทียบทั้งภาพปกติ ภาพกลับด้าน และภาพตัดขอบแน่นขึ้นเล็กน้อย
+            # คำนวณ deep_vec เพียง 1 ครั้งต่อตัว แล้วแชร์ให้มุมกลับด้านและมุมตัดชิด
+            deep_vec = compute_deep_feature(crop_img)
             query_vecs = [
-                extract_goat_vector(crop_img),
-                extract_goat_vector(ImageOps.mirror(crop_img)),
+                extract_goat_vector(crop_img, deep_vec),
+                extract_goat_vector(ImageOps.mirror(crop_img), deep_vec),
             ]
             if cw > 40 and ch > 40:
                 tight_crop = crop_img.crop((int(cw * 0.05), int(ch * 0.05), int(cw * 0.95), int(ch * 0.95)))
-                query_vecs.append(extract_goat_vector(tight_crop))
+                query_vecs.append(extract_goat_vector(tight_crop, deep_vec))
 
             best_match = None
             best_score = -1.0
